@@ -1,7 +1,11 @@
 #![deny(warnings)]
 #![warn(rust_2018_idioms)]
 
-use std::{collections::HashMap, sync::Arc, time::Instant};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use axum::{
     extract::{Query, State},
@@ -39,6 +43,7 @@ struct AppState {
 #[derive(Deserialize)]
 struct ForecastQueryParams {
     geocode: String,
+    language: String,
 }
 
 type Result<A> = std::result::Result<A, Box<dyn std::error::Error + Send + Sync>>;
@@ -112,7 +117,8 @@ async fn current(State(state): State<AppState>) -> Json<Value> {
 
 async fn forecast(State(state): State<AppState>, query: Query<ForecastQueryParams>) -> Json<Value> {
     let geocode = &query.geocode;
-    let cache_key = format!("{FORECAST}_{geocode}");
+    let language = &query.language;
+    let cache_key = format!("{FORECAST}_{geocode}_{language}");
     let cached_value = {
         let cached_entry = state.cached_entries.read().await;
         cached_entry
@@ -123,7 +129,9 @@ async fn forecast(State(state): State<AppState>, query: Query<ForecastQueryParam
 
     match cached_value {
         None => {
-            let json = fetch_forecast_json(&geocode, &state).await.unwrap();
+            let json = fetch_forecast_json(&geocode, &language, &state)
+                .await
+                .unwrap();
             let mut writeable_state = state.cached_entries.write().await;
             writeable_state.insert(
                 cache_key,
@@ -142,13 +150,13 @@ async fn fetch_current_json(state: &AppState) -> Result<Value> {
     let pws_id = state.config.pws_id.clone();
     let api_key = state.config.api_key.clone();
 
-    fetch_json(state, format!("https://api.weather.com/v2/pws/observations/current?stationId={pws_id}&format=json&units=e&apiKey={api_key}")).await
+    fetch_json(state, format!("https://api.weather.com/v2/pws/observations/current?stationId={pws_id}&format=json&units=m&apiKey={api_key}&numericPrecision=decimal")).await
 }
 
-async fn fetch_forecast_json(geocode: &str, state: &AppState) -> Result<Value> {
+async fn fetch_forecast_json(geocode: &str, language: &str, state: &AppState) -> Result<Value> {
     let api_key = state.config.api_key.clone();
 
-    fetch_json(state, format!("https://api.weather.com/v3/wx/forecast/daily/5day?geocode={geocode}&format=json&units=e&apiKey={api_key}")).await
+    fetch_json(state, format!("https://api.weather.com/v3/wx/forecast/daily/5day?geocode={geocode}&format=json&units=m&apiKey={api_key}&language={language}")).await
 }
 
 async fn fetch_json(state: &AppState, url: String) -> Result<Value> {
@@ -157,6 +165,7 @@ async fn fetch_json(state: &AppState, url: String) -> Result<Value> {
         .get(url)
         .header(reqwest::header::ACCEPT_ENCODING, "gzip")
         .header(reqwest::header::USER_AGENT, USER_AGENT)
+        .timeout(Duration::from_secs(5))
         .send()
         .await?
         .json::<Value>()
