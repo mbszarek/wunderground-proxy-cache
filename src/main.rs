@@ -1,15 +1,17 @@
 #![deny(warnings)]
 #![warn(rust_2018_idioms)]
 
-use std::{
-    sync::Arc,
-    time::Instant,
-};
+use std::{collections::HashMap, sync::Arc, time::Instant};
 
-use axum::{extract::State, routing::get, Json, Router};
-use constants::{API_KEY, CACHE_DURATION_SECS, PWS_ID};
+use axum::{
+    extract::{Query, State},
+    routing::get,
+    Json, Router,
+};
+use constants::{API_KEY, CACHE_DURATION_SECS, CURRENT, FORECAST, PWS_ID, USER_AGENT};
 
 use reqwest::Client;
+use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::RwLock;
 mod constants;
@@ -31,8 +33,15 @@ struct CachedEntry {
 struct AppState {
     config: AppConfig,
     client: Client,
-    cached_entry: Arc<RwLock<Option<CachedEntry>>>,
+    cached_entries: Arc<RwLock<HashMap<String, CachedEntry>>>,
 }
+
+#[derive(Deserialize)]
+struct ForecastQueryParams {
+    geocode: String,
+}
+
+type Result<A> = std::result::Result<A, Box<dyn std::error::Error + Send + Sync>>;
 
 fn load_config() -> AppConfig {
     let raw_cache_duration_secs =
@@ -52,7 +61,7 @@ fn load_config() -> AppConfig {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     let config = load_config();
@@ -60,10 +69,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let state = AppState {
         config: config,
         client: Client::new(),
-        cached_entry: Arc::new(RwLock::new(None)),
+        cached_entries: Arc::new(RwLock::new(HashMap::with_capacity(2))),
     };
 
-    let app = Router::new().route("/", get(root)).with_state(state);
+    let app = Router::new()
+        .route("/current", get(current))
+        .route("/forecast", get(forecast))
+        .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
 
@@ -72,35 +84,79 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     Ok(())
 }
 
-async fn root(State(state): State<AppState>) -> Json<Value> {
+async fn current(State(state): State<AppState>) -> Json<Value> {
     let cached_value = {
-        let cached_entry = state.cached_entry.read().await;
+        let cached_entry = state.cached_entries.read().await;
         cached_entry
-            .clone()
+            .get(CURRENT)
+            .cloned()
             .filter(|entry| entry.fetched_at.elapsed().as_secs() < state.config.cache_duration_secs)
     };
 
     match cached_value {
         None => {
-            let json = fetch_json(&state).await.unwrap();
-            let mut writeable_state = state.cached_entry.write().await;
-            *writeable_state = Some(CachedEntry {
-                value: json.clone(),
-                fetched_at: Instant::now(),
-            });
+            let json = fetch_current_json(&state).await.unwrap();
+            let mut writeable_state = state.cached_entries.write().await;
+            writeable_state.insert(
+                CURRENT.to_string(),
+                CachedEntry {
+                    value: json.clone(),
+                    fetched_at: Instant::now(),
+                },
+            );
             Json(json)
         }
         Some(cached_value) => Json(cached_value.value),
     }
 }
 
-async fn fetch_json(state: &AppState) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+async fn forecast(State(state): State<AppState>, query: Query<ForecastQueryParams>) -> Json<Value> {
+    let geocode = &query.geocode;
+    let cache_key = format!("{FORECAST}_{geocode}");
+    let cached_value = {
+        let cached_entry = state.cached_entries.read().await;
+        cached_entry
+            .get(&cache_key)
+            .cloned()
+            .filter(|entry| entry.fetched_at.elapsed().as_secs() < state.config.cache_duration_secs)
+    };
+
+    match cached_value {
+        None => {
+            let json = fetch_forecast_json(&geocode, &state).await.unwrap();
+            let mut writeable_state = state.cached_entries.write().await;
+            writeable_state.insert(
+                cache_key,
+                CachedEntry {
+                    value: json.clone(),
+                    fetched_at: Instant::now(),
+                },
+            );
+            Json(json)
+        }
+        Some(cached_value) => Json(cached_value.value),
+    }
+}
+
+async fn fetch_current_json(state: &AppState) -> Result<Value> {
     let pws_id = state.config.pws_id.clone();
     let api_key = state.config.api_key.clone();
 
-    let res = state.client.get(format!("https://api.weather.com/v2/pws/observations/current?stationId={pws_id}&format=json&units=e&apiKey={api_key}"))
+    fetch_json(state, format!("https://api.weather.com/v2/pws/observations/current?stationId={pws_id}&format=json&units=e&apiKey={api_key}")).await
+}
+
+async fn fetch_forecast_json(geocode: &str, state: &AppState) -> Result<Value> {
+    let api_key = state.config.api_key.clone();
+
+    fetch_json(state, format!("https://api.weather.com/v3/wx/forecast/daily/5day?geocode={geocode}&format=json&units=e&apiKey={api_key}")).await
+}
+
+async fn fetch_json(state: &AppState, url: String) -> Result<Value> {
+    let res = state
+        .client
+        .get(url)
         .header(reqwest::header::ACCEPT_ENCODING, "gzip")
-        .header(reqwest::header::USER_AGENT, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36")
+        .header(reqwest::header::USER_AGENT, USER_AGENT)
         .send()
         .await?
         .json::<Value>()
