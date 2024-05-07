@@ -1,0 +1,14 @@
+name: Publish Image for GHCR
+on:
+  [workflow_dispatch]
+
+jobs:
+  publish_image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Build and push the image
+        run: |
+          docker login --username mbszarek --password ${{ secrets.GH_PAT }} ghcr.io
+          docker build . --tag ghcr.io/mbszarek/wunderground-proxy:latest
+          docker push ghcr.io/mbszarek/wunderground-proxy:latest
